@@ -36,8 +36,13 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.DynamicRangeProfiles;
+import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.MediaCodecInfo;
+import android.media.MediaFormat;
 import android.media.MediaRecorder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -58,6 +63,7 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -110,6 +116,8 @@ public class Camera2VideoFragment extends Fragment
      */
     private CameraDevice mCameraDevice;
 
+    private CameraCharacteristics mCharacteristics;
+
     /**
      * A reference to the current {@link android.hardware.camera2.CameraCaptureSession} for
      * preview.
@@ -161,6 +169,8 @@ public class Camera2VideoFragment extends Fragment
      */
     private MediaRecorder mMediaRecorder;
 
+
+    private static final int RECORDER_VIDEO_BITRATE = 10000000;
     /**
      * Whether the app is recording video now
      */
@@ -431,13 +441,21 @@ public class Camera2VideoFragment extends Fragment
             String cameraId = manager.getCameraIdList()[0];
 
             // Choose the sizes for camera preview and video recording
-            CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
-            StreamConfigurationMap map = characteristics
+            mCharacteristics = manager.getCameraCharacteristics(cameraId);
+            StreamConfigurationMap map = mCharacteristics
                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            mSensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            mSensorOrientation = mCharacteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
             if (map == null) {
                 throw new RuntimeException("Cannot get available preview/video sizes");
             }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && DynamicRangeInfo.isTenBitProfileSupported(mCharacteristics)) {
+                List<DynamicRangeInfo> dynamicRangeList = DynamicRangeInfo.enumerateDynamicRangeProfiles(mCharacteristics);
+                Log.d(TAG, "lisl0105 dynamicRangeList: " + Arrays.toString(dynamicRangeList.toArray()));
+            } else {
+                Log.d(TAG, "lisl0105 not support 10bit");
+            }
+
             mVideoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder.class));
             mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class),
                     width, height, mVideoSize);
@@ -500,7 +518,36 @@ public class Camera2VideoFragment extends Fragment
             Surface previewSurface = new Surface(texture);
             mPreviewBuilder.addTarget(previewSurface);
 
+            /*
             mCameraDevice.createCaptureSession(Collections.singletonList(previewSurface),
+                    new CameraCaptureSession.StateCallback() {
+
+                        @Override
+                        public void onConfigured(@NonNull CameraCaptureSession session) {
+                            mPreviewSession = session;
+                            updatePreview();
+                        }
+
+                        @Override
+                        public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                            Activity activity = getActivity();
+                            if (null != activity) {
+                                Toast.makeText(activity, "Failed", Toast.LENGTH_SHORT).show();
+                            }
+                        }
+                    }, mBackgroundHandler);
+            */
+            List<OutputConfiguration> outputConfigurations = new ArrayList<>();
+            OutputConfiguration previewConfig = new OutputConfiguration(previewSurface);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (DynamicRangeInfo.isHLGSupport(mCharacteristics)) {
+                    previewConfig.setDynamicRangeProfile(DynamicRangeProfiles.HLG10);
+                } else {
+                    previewConfig.setDynamicRangeProfile(DynamicRangeProfiles.STANDARD);
+                }
+            }
+            outputConfigurations.add(previewConfig);
+            mCameraDevice.createCaptureSessionByOutputConfigurations(outputConfigurations,
                     new CameraCaptureSession.StateCallback() {
 
                         @Override
@@ -520,6 +567,44 @@ public class Camera2VideoFragment extends Fragment
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
+    }
+
+    private EncoderWrapper createEncoder(Long dynamicRangeProfile,
+                                         int width, int height,
+                                         int orientation, boolean useHardware,
+                                         int fps, File outputFile) throws IOException {
+        String videoEncoder = null;
+        if (dynamicRangeProfile == DynamicRangeProfiles.STANDARD) {
+            videoEncoder = MediaFormat.MIMETYPE_VIDEO_AVC;
+        } else if (dynamicRangeProfile <= DynamicRangeProfiles.PUBLIC_MAX) {
+            videoEncoder = MediaFormat.MIMETYPE_VIDEO_HEVC;
+        } else {
+            throw new IllegalArgumentException("Unknown dynamic range format");
+        }
+
+        int codecProfile = -1;
+        if (dynamicRangeProfile == DynamicRangeProfiles.HLG10) {
+            codecProfile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10;
+        } else if (dynamicRangeProfile == DynamicRangeProfiles.HDR10) {
+            codecProfile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10;
+        } else if (dynamicRangeProfile == DynamicRangeProfiles.HDR10_PLUS) {
+            codecProfile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus;
+        }
+
+        int finalWidth = width;
+        int finalHeight = height;
+        int orientationHint = orientation;
+
+        if (useHardware) {
+            if (orientation == 90 || orientation == 270) {
+                finalWidth = height;
+                finalHeight = width;
+            }
+            orientationHint = 0;
+        }
+
+        return new EncoderWrapper(width, height, RECORDER_VIDEO_BITRATE, fps,
+                orientationHint, videoEncoder, codecProfile, outputFile);
     }
 
     /**
